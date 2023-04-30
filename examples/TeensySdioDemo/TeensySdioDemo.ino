@@ -12,15 +12,25 @@ const uint8_t SD_CS_PIN = SS;
 const uint8_t SD_CS_PIN = SDCARD_SS_PIN;
 #endif  // SDCARD_SS_PIN
 
+EventResponder sd_event;
+volatile bool sd_transfer_complete = false;
+volatile bool sd_transfer_active = false;
+
+void sd_event_responder(EventResponderRef event_responder)
+{
+  sd_transfer_active = false;
+  sd_transfer_complete = true;
+}
+
 // SD_FAT_TYPE = 0 for SdFat/File as defined in SdFatConfig.h,
 // 1 for FAT16/FAT32, 2 for exFAT, 3 for FAT16/FAT32 and exFAT.
 #define SD_FAT_TYPE 3
 
-// 32 KiB buffer.
-const size_t BUF_DIM = 32768;
+// 128 KiB buffer.
+const size_t BUF_DIM = 131072;
 
 // 8 MiB file.
-const uint32_t FILE_SIZE = 256UL*BUF_DIM;
+const uint32_t FILE_SIZE = 64UL*BUF_DIM;
 
 #if SD_FAT_TYPE == 0
 SdFat sd;
@@ -39,9 +49,11 @@ FsFile file;
 #endif  // SD_FAT_TYPE
 
 uint8_t buf[BUF_DIM];
+volatile DMAMEM uint8_t async_buf[BUF_DIM] __attribute__((aligned(32)));
 
 // buffer as uint32_t
 uint32_t* buf32 = (uint32_t*)buf;
+uint32_t* async_buf32 = (uint32_t*)async_buf;
 
 // Total usec in read/write calls.
 uint32_t totalMicros = 0;
@@ -98,7 +110,7 @@ void yield() {
   yieldMicros += m;
 }
 //------------------------------------------------------------------------------
-void runTest() {
+void runTest(bool doAsyncRead) {
   // Zero Stats
   totalMicros = 0;
   yieldMicros = 0;
@@ -134,12 +146,23 @@ void runTest() {
     t = micros();
 
     for (uint32_t n = 0; n < nRdWr; n++) {
-      if ((int)nb != file.read(buf, nb)) {
-        errorHalt("read failed");
-      }
-      // crude check of data.
-      if (buf32[0] != n || buf32[nb/4 - 1] != n) {
-        errorHalt("data check");
+      if (!doAsyncRead) {
+        if ((int)nb != file.read(buf, nb)) {
+          errorHalt("read failed");
+        }
+        // crude check of data.
+        if (buf32[0] != n || buf32[nb/4 - 1] != n) {
+          errorHalt("data check");
+        }
+      } else {
+        sd_transfer_active = true;
+        sd_transfer_complete = false;
+        file.readAsync(((uint8_t *)async_buf), nb, n * nb, sd_event);
+        while (!sd_transfer_complete) {}
+        // crude check of data.
+        if (async_buf32[0] != n || async_buf32[(nb / 4) - 1] != n) {
+          errorHalt("data check");
+        }
       }
     }
     t = micros() - t;
@@ -164,10 +187,12 @@ void setup() {
   Serial.begin(9600);
   while (!Serial) {
   }
+  sd_event.attachImmediate(&sd_event_responder);
 }
 //------------------------------------------------------------------------------
 void loop() {
   static bool warn = true;
+  bool doAsyncRead = false;
   if (warn) {
     warn = false;
     Serial.println(
@@ -181,7 +206,9 @@ void loop() {
     "\nType '1' for FIFO SDIO"
     "\n     '2' for DMA SDIO"
     "\n     '3' for Dedicated SPI"
-    "\n     '4' for Shared SPI");
+    "\n     '4' for Shared SPI"
+    "\n     '5' for FIFO SDIO and asynchronous DMA reads"
+    "\n     '6' for DMA SDIO and asynchronous DMA reads");
   while (!Serial.available()) {
   }
   char c = Serial.read();
@@ -211,11 +238,23 @@ void loop() {
       errorHalt("begin failed");
     }
     Serial.println("\nShared SPI mode - slow for small transfers.");
+  } else if (c == '5') {
+    if (!sd.begin(SdioConfig(FIFO_SDIO))) {
+      errorHalt("begin failed");
+    }
+    doAsyncRead = true;
+    Serial.println("\nFIFO SDIO mode, asynchronous reads.");
+  } else if (c == '6') {
+    if (!sd.begin(SdioConfig(DMA_SDIO))) {
+      errorHalt("begin failed");
+    }
+    doAsyncRead = true;
+    Serial.println("\nDMA SDIO mode, asynchronous reads.");
   } else {
     Serial.println("Invalid input");
     return;
   }
   ready = true;
-  runTest();
+  runTest(doAsyncRead);
   ready = false;
 }
