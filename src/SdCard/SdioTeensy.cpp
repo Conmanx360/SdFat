@@ -203,11 +203,13 @@ static uint8_t m_errorCode = SD_CARD_ERROR_INIT_NOT_CALLED;
 static uint32_t m_errorLine = 0;
 static uint32_t m_rca;
 static volatile bool m_dmaBusy = false;
+static volatile bool m_admaBusy = false;
 static volatile uint32_t m_irqstat;
 static uint32_t m_sdClkKhz = 0;
 static uint32_t m_ocr;
 static cid_t m_cid;
 static csd_t m_csd;
+static volatile EventResponder *_dma_event_responder;
 //==============================================================================
 #define DBG_TRACE Serial.print("TRACE."); Serial.println(__LINE__); delay(200);
 #define USE_DEBUG_MODE 0
@@ -277,6 +279,8 @@ inline bool setSdErrorCode(uint8_t code, uint32_t line) {
 #endif  // USE_DEBUG_MODE
   return false;
 }
+#define SDHC_PROCTL_DMAS_MASK                 0x300U
+#define SDHC_PROCTL_ADMA2_EN                  0x200U
 //==============================================================================
 // ISR
 static void sdIrs() {
@@ -286,6 +290,15 @@ static void sdIrs() {
 #if defined(__IMXRT1062__)
   SDHC_MIX_CTRL &= ~(SDHC_MIX_CTRL_AC23EN | SDHC_MIX_CTRL_DMAEN);
 #endif
+  if (_dma_event_responder && m_admaBusy)
+  {
+    _dma_event_responder->triggerEvent();
+    _dma_event_responder = NULL;
+    SDHC_ADSADDR = (uint32_t)0;
+    SDHC_DSADDR  = (uint32_t)0;
+    SDHC_PROCTL &= ~SDHC_PROCTL_DMAS_MASK;
+    m_admaBusy = false;
+  }
   m_dmaBusy = false;
 }
 //==============================================================================
@@ -495,21 +508,42 @@ static bool isBusyTransferComplete() {
   return !(SDHC_IRQSTAT & (SDHC_IRQSTAT_TC | SDHC_IRQSTAT_ERROR));
 }
 //------------------------------------------------------------------------------
-static bool rdWrSectors(uint32_t xfertyp,
-                       uint32_t sector, uint8_t* buf, size_t n) {
+static bool transferStop();
+static bool rdWrSectorsCommon(uint32_t xfertyp,
+                       uint32_t sector, uint8_t* buf, size_t n, struct adma2Descriptor *adma_desc) {
   if ((3 & (uint32_t)buf) || n == 0) {
     return sdError(SD_CARD_ERROR_DMA);
   }
   if (yieldTimeout(isBusyCMD13)) {
     return sdError(SD_CARD_ERROR_CMD13);
   }
+  SDHC_PROCTL &= ~SDHC_PROCTL_DMAS_MASK;
+  if (adma_desc) {
+    SDHC_PROCTL &= ~(SDHC_PROCTL_CREQ | SDHC_PROCTL_SABGREQ);
+    SDHC_PROCTL |= SDHC_PROCTL_ADMA2_EN;
+    SDHC_ADSADDR = (uint32_t)adma_desc;
+    SDHC_DSADDR  = (uint32_t)0;
+    m_admaBusy = true;
+  } else {
+    SDHC_ADSADDR = (uint32_t)0;
+    SDHC_DSADDR  = (uint32_t)buf;
+  }
+
   enableDmaIrs();
-  SDHC_DSADDR  = (uint32_t)buf;
   SDHC_BLKATTR = SDHC_BLKATTR_BLKCNT(n) | SDHC_BLKATTR_BLKSIZE(512);
   SDHC_IRQSIGEN = SDHC_IRQSIGEN_MASK;
   if (!cardCommand(xfertyp, m_highCapacity ? sector : 512*sector)) {
     return false;
   }
+
+  return true;
+};
+//------------------------------------------------------------------------------
+static bool rdWrSectors(uint32_t xfertyp,
+                       uint32_t sector, uint8_t* buf, size_t n) {
+  if (!rdWrSectorsCommon(xfertyp, sector, buf, n, NULL))
+    return false;
+
   return waitDmaStatus();
 }
 //------------------------------------------------------------------------------
@@ -635,6 +669,136 @@ static bool waitTransferComplete() {
   }
   return true;
 }
+
+#define ADMA2_DESCRIPTOR_VALID_FLAG        0x01U
+#define ADMA2_DESCRIPTOR_END_FLAG          0x02U
+#define ADMA2_DESCRIPTOR_INT_FLAG          0x04U
+#define ADMA2_DESCRIPTOR_ACTIVITY1_FLAG    0x10U
+#define ADMA2_DESCRIPTOR_ACTIVITY2_FLAG    0x20U
+#define ADMA2_DESCRIPTOR_TRANSFER_FLAGS    (ADMA2_DESCRIPTOR_ACTIVITY2_FLAG | ADMA2_DESCRIPTOR_VALID_FLAG)
+#define ADMA2_DESCRIPTOR_FINAL_FLAGS       (ADMA2_DESCRIPTOR_TRANSFER_FLAGS | ADMA2_DESCRIPTOR_END_FLAG)
+/*
+ * According to DMA Host controller standard, a descriptor with a length of 0 represents 65536 bytes.
+ * That doesn't seem to be the case here, it just errors out instead. In order to align things on
+ * 4 byte boundaries, we'll max out at 65532 instead of 65535.
+ */
+#define MAX_ADMA2_DESC_LEN 65532
+
+struct adma2Descriptor {
+  uint16_t attribute;
+  uint16_t len;
+  uint32_t addr;
+};
+
+#define ADMA2_DESCRIPTOR_COUNT 10
+#define ADMA2_DESCRIPTOR_BUF_SIZE (sizeof(struct adma2Descriptor) * ADMA2_DESCRIPTOR_COUNT)
+static uint32_t adma2Descriptors[ADMA2_DESCRIPTOR_BUF_SIZE / sizeof(uint32_t)] __attribute__((aligned(sizeof(uint32_t))));
+static uint16_t curAdma2DescriptorsCount;
+static uint32_t curAdma2DescriptorsCombinedLen;
+static DMAMEM uint32_t sector_pad_buf[2][128] __attribute__((aligned(32)));
+
+#if USE_DEBUG_MODE
+static void printAdma2Descriptor(struct adma2Descriptor *desc, uint32_t descNumber) {
+    Serial.printf("\t\tDescriptor %d:\n", descNumber);
+    Serial.printf("\t\t________________________________________________________________\n");
+    Serial.printf("\t\t|      Attribute field      |   Length field   | Address field |\n");
+    Serial.printf("\t\t|-----+---+---+-+-----+-----|------------------|---------------|\n");
+    Serial.printf("\t\t|Valid|End|Int|x|Act 1|Act 2|   16-bit length  | 32-bit addr   |\n");
+    Serial.printf("\t\t|-----+---+---+-+-----+-----|------------------|---------------|\n");
+    Serial.printf("\t\t|  %u  | %u | %u |x|  %u  |  %u  |", bitRead(desc->attribute, 0), bitRead(desc->attribute, 1), bitRead(desc->attribute, 2), bitRead(desc->attribute, 4), bitRead(desc->attribute, 5));
+    Serial.printf("       %05u      |  0x%08x   |\n", desc->len, desc->addr);
+}
+#endif  // USE_DEBUG_MODE
+
+static void setAdma2Descriptor(struct adma2Descriptor *desc, const uint32_t *address, const uint16_t len,
+    const uint16_t attribute) {
+  desc->len = len;
+  desc->attribute = attribute;
+  desc->addr = (uint32_t)address;
+}
+
+static bool pushAdma2Descriptor(const uint32_t *dest_buf, uint16_t len, bool isFinalDescriptor) {
+  struct adma2Descriptor *desc;
+
+  if (!(curAdma2DescriptorsCount < (ADMA2_DESCRIPTOR_COUNT)))
+    return false;
+
+  desc = &((struct adma2Descriptor *)adma2Descriptors)[curAdma2DescriptorsCount];
+  if (isFinalDescriptor)
+    setAdma2Descriptor(desc, dest_buf, (const uint16_t)len, ADMA2_DESCRIPTOR_FINAL_FLAGS);
+  else
+    setAdma2Descriptor(desc, dest_buf, (const uint16_t)len, ADMA2_DESCRIPTOR_TRANSFER_FLAGS);
+
+  curAdma2DescriptorsCombinedLen += len;
+  curAdma2DescriptorsCount++;
+  return true;
+}
+
+bool SdioCard::readSectorsAsync(uint32_t sector, uint32_t sectorStartByteOffset, size_t nBytes, uint8_t *dst,
+    EventResponderRef eventResponder) {
+  uint32_t *cur_buf_offset = (uint32_t *)dst;
+  uint32_t sectorEndByteOffset, sectorsCount;
+  uint32_t tmp_len = nBytes;
+
+  if (!m_sdioConfig.useDma()) {
+    syncDevice();
+  }
+
+  curAdma2DescriptorsCombinedLen = curAdma2DescriptorsCount = 0;
+  memset(adma2Descriptors, 0, sizeof(adma2Descriptors));
+  if (sectorStartByteOffset)
+    pushAdma2Descriptor((const uint32_t *)sector_pad_buf[0], sectorStartByteOffset, false);
+
+  while (tmp_len > MAX_ADMA2_DESC_LEN) {
+    pushAdma2Descriptor((const uint32_t *)cur_buf_offset, MAX_ADMA2_DESC_LEN, false);
+    tmp_len -= MAX_ADMA2_DESC_LEN;
+    cur_buf_offset += (MAX_ADMA2_DESC_LEN / sizeof(uint32_t));
+  }
+
+  sectorEndByteOffset = ((nBytes + sectorStartByteOffset) % 512);
+  if (sectorEndByteOffset) {
+    /* Need to add padding on the end to align to block size. */
+    pushAdma2Descriptor((const uint32_t *)cur_buf_offset, tmp_len, false);
+    pushAdma2Descriptor((const uint32_t *)&sector_pad_buf[1], 512 - sectorEndByteOffset, true);
+  } else {
+    pushAdma2Descriptor((const uint32_t *)cur_buf_offset, tmp_len, true);
+  }
+
+#if USE_DEBUG_MODE
+  if (USE_DEBUG_MODE) {
+    for (uint16_t i = 0; i < curAdma2DescriptorsCount; i++) {
+      struct adma2Descriptor *desc = &((struct adma2Descriptor *)adma2Descriptors)[i];
+
+      printAdma2Descriptor(desc, i);
+    }
+    Serial.printf("Total length: %d Sector Count: %d\n", curAdma2DescriptorsCombinedLen, (curAdma2DescriptorsCombinedLen / 512));
+  }
+#endif  // USE_DEBUG_MODE
+
+  eventResponder.clearEvent();
+  _dma_event_responder = &eventResponder;
+  sectorsCount = (curAdma2DescriptorsCombinedLen / 512);
+  if ((uint32_t)dst >= 0x20200000u) arm_dcache_delete(dst, nBytes);
+  if (!rdWrSectorsCommon(CMD18_DMA_XFERTYP, sector, dst, sectorsCount, (struct adma2Descriptor *)adma2Descriptors)) {
+    m_admaBusy = false;
+    _dma_event_responder = NULL;
+    SDHC_PROCTL &= ~SDHC_PROCTL_DMAS_MASK;
+    SDHC_ADSADDR = (uint32_t)0;
+    return false;
+  }
+
+  return true;
+}
+
+//------------------------------------------------------------------------------
+// Set ADMA descriptor.
+bool SdioCard::supportsAsync() {
+/*
+  printRegs(__LINE__);
+*/
+  return true;
+}
+
 //==============================================================================
 // Start of SdioCard member functions.
 //==============================================================================
@@ -913,6 +1077,8 @@ bool SdioCard::readStart(uint32_t sector) {
   if (yieldTimeout(isBusyCMD13)) {
     return sdError(SD_CARD_ERROR_CMD13);
   }
+  _dma_event_responder = NULL;
+  SDHC_PROCTL &= ~SDHC_PROCTL_DMAS_MASK;
   SDHC_PROCTL |= SDHC_PROCTL_SABGREQ;
 #if defined(__IMXRT1062__)
   // Infinite transfer.

@@ -722,6 +722,134 @@ bool FatFile::preAllocate(uint32_t length) {
  fail:
   return false;
 }
+/*
+ * User provides a starting cluster with an associated offset, function returns a cluster.
+ */
+bool FatFile::getClusterForFilePos(uint32_t startCluster, uint32_t startClusterFilePos,
+        uint32_t filePos, uint32_t *outCluster, bool stopAtNonContiguous) {
+  uint32_t nNew, tmp;
+
+  // calculate cluster index for new position
+  nNew = ((filePos - startClusterFilePos)) >> (m_vol->bytesPerClusterShift());
+#if USE_FAT_FILE_FLAG_CONTIGUOUS
+  if (isContiguous()) {
+    *outCluster = startCluster + nNew;
+    goto done;
+  }
+#endif  // USE_FAT_FILE_FLAG_CONTIGUOUS
+  tmp = startCluster;
+  while (nNew--) {
+    uint32_t tmp2;
+
+    if (m_vol->fatGet(tmp, &tmp2) <= 0) {
+      DBG_FAIL_MACRO;
+      goto fail;
+    }
+
+    if (stopAtNonContiguous && (tmp2 != (tmp + 1)))
+      break;
+    tmp = tmp2;
+  }
+
+  *outCluster = tmp;
+ done:
+  return true;
+
+ fail:
+  *outCluster = 0;
+  return false;
+
+}
+int FatFile::readAsync(void* buf, size_t nbyte, uint32_t filePos, EventResponderRef eventResponder) {
+  uint32_t clusterFindStartCluster, clusterFindStartClusterPos, clusterStart, clusterEnd;
+  uint32_t clusterBitmask = (m_vol->bytesPerCluster() - 1);
+  uint32_t sectorStart, sectorStartOffset, bytesToRead = 0;
+
+  if (!m_vol->m_blockDev->supportsAsync())
+    return -1;
+
+  // error if not open for read
+  if (!isReadable()) {
+    DBG_FAIL_MACRO;
+    goto fail;
+  }
+
+  /*
+   * Step 1: Calculate amount of bytes to read. If we request more bytes than
+   * the file has left, we change the amount of bytes to the remaining count.
+   */
+  if (isFile()) {
+    if (filePos > m_fileSize) {
+      DBG_FAIL_MACRO;
+      goto fail;
+    } else {
+      uint32_t tmp32 = m_fileSize - filePos;
+
+      if (nbyte >= tmp32)
+        nbyte = tmp32;
+    }
+  } else if (isRootFixed()) {
+    if (filePos > FS_DIR_SIZE*m_vol->rootDirEntryCount()) {
+      DBG_FAIL_MACRO;
+      goto fail;
+    } else {
+      uint16_t tmp16 = FS_DIR_SIZE*m_vol->m_rootDirEntryCount - (uint16_t)filePos;
+
+      if (nbyte > tmp16)
+        nbyte = tmp16;
+    }
+  }
+
+  if ((m_curPosition && filePos) && (m_curPosition <= (filePos))) {
+    clusterFindStartCluster = m_curCluster;
+    clusterFindStartClusterPos = m_curPosition & ~(clusterBitmask);
+  } else {
+    clusterFindStartCluster = m_firstCluster;
+    clusterFindStartClusterPos = 0;
+  }
+
+  if (!getClusterForFilePos(clusterFindStartCluster, clusterFindStartClusterPos, filePos, &clusterStart, false))
+    goto fail;
+
+  if (!getClusterForFilePos(clusterStart, (filePos & ~(clusterBitmask)), filePos + nbyte, &clusterEnd, true))
+    goto fail;
+
+  /* Get the amount of bytes we'll read from this set of contiguous sectors. */
+  bytesToRead = m_vol->bytesPerCluster() - (filePos & clusterBitmask);
+  bytesToRead += (clusterEnd - clusterStart) * m_vol->bytesPerCluster();
+  if (bytesToRead < nbyte) {
+    m_asyncTransferNeedsContinue = true;
+    m_asyncTransferContinuePos = filePos + bytesToRead;
+    m_asyncTransferContinueBytesLeft = nbyte - bytesToRead;
+  } else {
+    m_asyncTransferNeedsContinue = false;
+    m_asyncTransferContinuePos = 0;
+    m_asyncTransferContinueBytesLeft = 0;
+  }
+  sectorStart = m_vol->clusterStartSector(clusterStart) + m_vol->sectorOfCluster(filePos);
+  sectorStartOffset = filePos & m_vol->sectorMask();
+/*
+  Serial.printf("Cluster at file pos %d: %d\n", filePos, clusterStart);
+  Serial.printf("Ending at cluster %d\n", clusterEnd);
+  Serial.printf("m_asyncTransferNeedsContinue %d.\n", m_asyncTransferNeedsContinue);
+  Serial.printf("sectorStart %d, sectorStartOffset %d\n", sectorStart, sectorStartOffset);
+  Serial.printf("m_asyncTransferContinuePos %d, m_asyncTransferContinueBytesLeft %d\n",
+      m_asyncTransferContinuePos, m_asyncTransferContinueBytesLeft);
+*/
+  if (!m_vol->m_blockDev->readSectorsAsync(sectorStart, sectorStartOffset, nbyte, (uint8_t *)buf, eventResponder)) {
+    m_asyncTransferNeedsContinue = false;
+    m_asyncTransferContinuePos = 0;
+    m_asyncTransferContinueBytesLeft = 0;
+    goto fail;
+  }
+
+  m_asyncTransferActive = 1;
+  return bytesToRead;
+
+ fail:
+  m_error |= READ_ERROR;
+  return -1;
+}
 //------------------------------------------------------------------------------
 int FatFile::read(void* buf, size_t nbyte) {
   int8_t fg;

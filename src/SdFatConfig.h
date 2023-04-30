@@ -417,6 +417,12 @@ typedef uint8_t SdCsPin_t;
 #endif  // defined(__MK64FX512__) || defined(__MK66FX1M0__)
 #if defined(__IMXRT1062__)
 #define HAS_SDIO_CLASS 1
+#ifndef HAS_ASYNC_TRANSFER
+#define HAS_ASYNC_TRANSFER 0
+#endif
+#if defined(__has_include) && __has_include(<EventResponder.h>)
+#include <EventResponder.h>
+#endif
 #endif  // defined(__IMXRT1062__)
 //------------------------------------------------------------------------------
 /**

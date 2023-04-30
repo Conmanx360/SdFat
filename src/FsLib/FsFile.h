@@ -579,6 +579,28 @@ class FsBaseFile {
     return m_fFile ? m_fFile->read(buf, count) :
            m_xFile ? m_xFile->read(buf, count) : -1;
   }
+
+#ifdef HAS_ASYNC_TRANSFER
+  /** Read data asynchronously from a file starting at the current position.
+   *
+   * \param[out] buf Pointer to the location that will receive the data.
+   *
+   * \param[in] count Maximum number of bytes to read.
+   *
+   * \param[in] event_responder Event responder to call when read complete.
+   *
+   * \return For success read() returns the number of bytes read.
+   * A value less than \a count, including zero, will be returned
+   * if end of file is reached.
+   * If an error occurs, read() returns -1.  Possible errors include
+   * read() called before a file has been opened, corrupt file system
+   * or an I/O error occurred.
+   */
+  int readAsync(void* buf, size_t count, uint32_t filePos, EventResponderRef eventResponder) {
+    return m_fFile ? m_fFile->readAsync(buf, count, filePos, eventResponder) : -1;
+  }
+#endif
+
   /** Remove a file.
    *
    * The directory entry and all data for the file are deleted.

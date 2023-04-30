@@ -66,6 +66,29 @@ class FsBlockDeviceInterface {
   virtual bool readSectors(uint32_t sector, uint8_t* dst, size_t ns) = 0;
 
   /**
+   * Check if FsBlockDevice supports asynchronous operations.
+   *
+   * \return true if it does, false if it does not.
+   */
+  virtual bool supportsAsync() {
+    return false;
+  };
+
+  /**
+   * Read multiple sectors asynchronously.
+   *
+   * \param[in] sector Logical sector to be read.
+   * \param[in] ns Number of sectors to be read.
+   * \param[out] dst Pointer to the location that will receive the data.
+   * \param[in] event_responder EventResponder used to signal the read is
+   *            complete.
+   * \return true for success or false for failure.
+   */
+  virtual bool readSectorsAsync(uint32_t sector, uint32_t sectorStartByteOffset, size_t nBytes, uint8_t *dst,
+      EventResponderRef eventResponder) {
+    return false;
+  };
+  /**
    * Read multiple sectors with callback as each sector's data
    *
    * \param[in] sector Logical sector to be read.

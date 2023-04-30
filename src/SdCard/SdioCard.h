@@ -114,6 +114,12 @@ class SdioCard : public SdCardInterface {
    * \return true for success or false for failure.
    */
   bool readSectors(uint32_t sector, uint8_t* dst, size_t ns);
+
+#ifdef HAS_ASYNC_TRANSFER
+  bool supportsAsync();
+  bool readSectorsAsync(uint32_t sector, uint32_t sectorStartByteOffset, size_t nBytes, uint8_t *dst, EventResponderRef eventResponder);
+#endif
+
   /**
    * Read a card's CID register. The CID contains card identification
    * information such as Manufacturer ID, Product name, Product serial

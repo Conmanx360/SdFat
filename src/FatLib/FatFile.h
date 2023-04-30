@@ -730,6 +730,20 @@ class FatFile {
    * If an error occurs, read() returns -1.
    */
   int read(void* buf, size_t count);
+  /** Read data from a file asynchronously starting at filePos.
+   *
+   * \param[out] buf Pointer to the location that will receive the data.
+   *
+   * \param[in] count Maximum number of bytes to read.
+   *
+   * \return For success read() returns the number of bytes read.
+   * A value less than \a nbyte, including zero, will be returned
+   * if end of file is reached.
+   * If an error occurs, read() returns -1.
+   */
+#ifdef HAS_ASYNC_TRANSFER
+  int readAsync(void* buf, size_t nbyte, uint32_t filePos, EventResponderRef eventResponder);
+#endif
   /** Read the next directory entry from a directory file.
    *
    * \param[out] dir The DirFat_t struct that will receive the data.
@@ -983,6 +997,10 @@ class FatFile {
 
   // private functions
 
+  bool getClusterForFilePos(uint32_t startCluster, uint32_t startClusterFilePos,
+        uint32_t filePos, uint32_t *outCluster, bool stopAtNonContiguous);
+  size_t getContiguousSectorsAtFilePos(uint32_t filePos, size_t toRead,
+      uint32_t *sectorStart, uint32_t *sectorStartOffset, uint32_t *sectorEnd, uint32_t *sectorEndOffset);
   bool addCluster();
   bool addDirCluster();
   DirFat_t* cacheDir(uint16_t index) {
@@ -1039,6 +1057,11 @@ class FatFile {
   uint32_t   m_dirSector;        // sector for this files directory entry
   uint32_t   m_fileSize;         // file size in bytes
   uint32_t   m_firstCluster;     // first cluster of file
+
+  uint8_t    m_asyncTransferActive;
+  uint8_t    m_asyncTransferNeedsContinue;
+  uint32_t   m_asyncTransferContinuePos;
+  uint32_t   m_asyncTransferContinueBytesLeft;
 };
 
 #include "../common/ArduinoFiles.h"
