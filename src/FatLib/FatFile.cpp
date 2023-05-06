@@ -760,7 +760,7 @@ bool FatFile::getClusterForFilePos(uint32_t startCluster, uint32_t startClusterF
   return false;
 
 }
-int FatFile::readAsync(void* buf, size_t nbyte, uint32_t filePos, EventResponderRef eventResponder) {
+int FatFile::readAsync(void* buf, size_t nbyte, uint64_t filePos, EventResponderRef eventResponder) {
   uint32_t clusterFindStartCluster, clusterFindStartClusterPos, clusterStart, clusterEnd;
   uint32_t clusterBitmask = (m_vol->bytesPerCluster() - 1);
   uint32_t sectorStart, sectorStartOffset, bytesToRead = 0;

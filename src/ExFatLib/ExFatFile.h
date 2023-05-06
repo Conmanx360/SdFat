@@ -558,6 +558,20 @@ class ExFatFile {
    * If an error occurs, read() returns -1.
    */
   int read(void* buf, size_t count);
+  /** Read data from a file asynchronously starting at filePos.
+   *
+   * \param[out] buf Pointer to the location that will receive the data.
+   *
+   * \param[in] count Maximum number of bytes to read.
+   *
+   * \return For success read() returns the number of bytes read.
+   * A value less than \a nbyte, including zero, will be returned
+   * if end of file is reached.
+   * If an error occurs, read() returns -1.
+   */
+#ifdef HAS_ASYNC_TRANSFER
+  int readAsync(void* buf, size_t nbyte, uint64_t filePos, EventResponderRef eventResponder);
+#endif
   /** Remove a file.
    *
    * The directory entry and all data for the file are deleted.
@@ -759,6 +773,8 @@ class ExFatFile {
  private:
   /** ExFatVolume allowed access to private members. */
   friend class ExFatVolume;
+  bool getClusterForFilePos(uint32_t startCluster, uint64_t startClusterFilePos,
+        uint64_t filePos, uint32_t *outCluster, bool stopAtNonContiguous);
   bool addCluster();
   bool addDirCluster();
   bool cmpName(const DirName_t* dirName, ExName_t* fname);
@@ -816,6 +832,11 @@ class ExFatFile {
   uint8_t       m_attributes = FILE_ATTR_CLOSED;
   uint8_t       m_error = 0;
   uint8_t       m_flags = 0;
+
+  uint8_t    m_asyncTransferActive;
+  uint8_t    m_asyncTransferNeedsContinue;
+  uint64_t   m_asyncTransferContinuePos;
+  uint32_t   m_asyncTransferContinueBytesLeft;
 };
 
 #include "../common/ArduinoFiles.h"

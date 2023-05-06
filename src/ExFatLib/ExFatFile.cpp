@@ -626,6 +626,112 @@ int ExFatFile::read(void* buf, size_t count) {
   return -1;
 }
 //------------------------------------------------------------------------------
+bool ExFatFile::getClusterForFilePos(uint32_t startCluster, uint64_t startClusterFilePos,
+    uint64_t filePos, uint32_t *outCluster, bool stopAtNonContiguous) {
+  uint64_t nNew;
+  uint32_t tmp;
+
+  // calculate cluster index for new position
+  nNew = ((filePos - startClusterFilePos)) >> (m_vol->bytesPerClusterShift());
+  if (isContiguous()) {
+    *outCluster = startCluster + nNew;
+    goto done;
+  }
+  tmp = startCluster;
+  while (nNew--) {
+    uint32_t tmp2;
+
+    if (m_vol->fatGet(tmp, &tmp2) <= 0) {
+      DBG_FAIL_MACRO;
+      goto fail;
+    }
+
+    if (stopAtNonContiguous && (tmp2 != (tmp + 1)))
+      break;
+    tmp = tmp2;
+  }
+
+  *outCluster = tmp;
+ done:
+  return true;
+
+fail:
+  *outCluster = 0;
+  return false;
+}
+//------------------------------------------------------------------------------
+int ExFatFile::readAsync(void* buf, size_t nbyte, uint64_t filePos, EventResponderRef eventResponder) {
+  uint64_t clusterFindStartCluster, clusterFindStartClusterPos;
+  uint64_t clusterBitmask = (m_vol->bytesPerCluster() - 1);
+  uint64_t sectorStart, sectorStartOffset, bytesToRead = 0;
+  uint32_t clusterStart, clusterEnd;
+
+  if (!m_vol->m_blockDev->supportsAsync())
+    return -1;
+
+  // error if not open for read
+  if (!isReadable()) {
+    DBG_FAIL_MACRO;
+    goto fail;
+  }
+
+  if (isContiguous() || isFile()) {
+    if ((filePos + nbyte) > m_validLength) {
+      nbyte = m_validLength - filePos;
+    }
+  }
+
+  if ((m_curPosition && filePos) && (m_curPosition <= (filePos))) {
+    clusterFindStartCluster = m_curCluster;
+    clusterFindStartClusterPos = m_curPosition & ~(clusterBitmask);
+  } else {
+    clusterFindStartCluster = m_firstCluster;
+    clusterFindStartClusterPos = 0;
+  }
+
+  if (!getClusterForFilePos(clusterFindStartCluster, clusterFindStartClusterPos, filePos, &clusterStart, false))
+    goto fail;
+
+  if (!getClusterForFilePos(clusterStart, (filePos & ~(clusterBitmask)), filePos + nbyte, &clusterEnd, true))
+    goto fail;
+
+  /* Get the amount of bytes we'll read from this set of contiguous sectors. */
+  bytesToRead = m_vol->bytesPerCluster() - (filePos & clusterBitmask);
+  bytesToRead += (clusterEnd - clusterStart) * m_vol->bytesPerCluster();
+  if (bytesToRead < nbyte) {
+    m_asyncTransferNeedsContinue = true;
+    m_asyncTransferContinuePos = filePos + bytesToRead;
+    m_asyncTransferContinueBytesLeft = nbyte - bytesToRead;
+  } else {
+    m_asyncTransferNeedsContinue = false;
+    m_asyncTransferContinuePos = 0;
+    m_asyncTransferContinueBytesLeft = 0;
+  }
+  sectorStart = m_vol->clusterStartSector(clusterStart) + ((filePos >> 9) & (m_vol->sectorsPerCluster() - 1));
+  sectorStartOffset = filePos & m_vol->sectorMask();
+/*
+  Serial.printf("Cluster at file pos %lld: %d\n", filePos, clusterStart);
+  Serial.printf("Ending at cluster %d\n", clusterEnd);
+  Serial.printf("m_asyncTransferNeedsContinue %d.\n", m_asyncTransferNeedsContinue);
+  Serial.printf("sectorStart %d, sectorStartOffset %d\n", sectorStart, sectorStartOffset);
+  Serial.printf("m_asyncTransferContinuePos %d, m_asyncTransferContinueBytesLeft %d\n",
+      m_asyncTransferContinuePos, m_asyncTransferContinueBytesLeft);
+*/
+  if (!m_vol->m_blockDev->readSectorsAsync(sectorStart, sectorStartOffset, nbyte, (uint8_t *)buf, eventResponder)) {
+    m_asyncTransferNeedsContinue = false;
+    m_asyncTransferContinuePos = 0;
+    m_asyncTransferContinueBytesLeft = 0;
+    goto fail;
+  }
+
+  m_asyncTransferActive = 1;
+  return bytesToRead;
+
+ fail:
+  m_error |= READ_ERROR;
+  return -1;
+}
+//------------------------------------------------------------------------------
 bool ExFatFile::remove(const char* path) {
   ExFatFile file;
   if (!file.open(this, path, O_WRONLY)) {

@@ -742,7 +742,7 @@ class FatFile {
    * If an error occurs, read() returns -1.
    */
 #ifdef HAS_ASYNC_TRANSFER
-  int readAsync(void* buf, size_t nbyte, uint32_t filePos, EventResponderRef eventResponder);
+  int readAsync(void* buf, size_t nbyte, uint64_t filePos, EventResponderRef eventResponder);
 #endif
   /** Read the next directory entry from a directory file.
    *

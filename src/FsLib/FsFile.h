@@ -596,8 +596,9 @@ class FsBaseFile {
    * read() called before a file has been opened, corrupt file system
    * or an I/O error occurred.
    */
-  int readAsync(void* buf, size_t count, uint32_t filePos, EventResponderRef eventResponder) {
-    return m_fFile ? m_fFile->readAsync(buf, count, filePos, eventResponder) : -1;
+  int readAsync(void* buf, size_t count, uint64_t filePos, EventResponderRef eventResponder) {
+    return m_fFile ? m_fFile->readAsync(buf, count, filePos, eventResponder) :
+	   m_xFile ? m_xFile->readAsync(buf, count, filePos, eventResponder) : -1;
   }
 #endif
 
